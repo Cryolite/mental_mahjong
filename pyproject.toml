@@ -1,0 +1,29 @@
+[tool.poetry]
+name = "mental-mahjong"
+version = "0.1.0"
+description = ""
+authors = ["Cryolite <cryolite.indigo@gmail.com>"]
+#readme = "README.md"
+packages = [
+    { include = "mental_mahjong", from = "src" }
+]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+pyzmq = "^25.1.2"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 79
+
+[tool.ruff.lint]
+ignore = ["F401"] # imported but unused
+
+[tool.ruff.pycodestyle]
+max-doc-length = 72
+
+[tool.ruff.pydocstyle]
+convention = "google"
