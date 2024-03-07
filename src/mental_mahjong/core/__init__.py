@@ -7,4 +7,3 @@ from .el_gamal import (
 from .communicator import Communicator  # noqa: F401
 from .agreements import agree_on_random_integer, agree_on_seats  # noqa: F401
 from .cryptosystem import Cryptosystem  # noqa: F401
-from .pedersen1991 import Pedersen1991  # noqa: F401

@@ -6,44 +6,57 @@ from mental_mahjong.core import Communicator
 
 
 def agree_on_random_integer(
-    communicator: Communicator, upper_bound: int
+    communicator: Communicator, a: int, b: int | None = None
 ) -> int:
     """Agrees on a random integer.
 
     This function implements a cooperation protocol among participants
     of the communicator. It ensures that all participants agree on a
-    random integer within the specified range [0, upper_bound).
+    random integer within the specified range.
 
     Args:
         communicator: Facilitates the cooperation among its
             participants.
-        upper_bound: The exclusive upper bound of the random integer to
-            be agreed upon. Must be a positive integer.
+        a: Must be a non-negative integer. If `b` is not specified, the
+            range is [0, a). Otherwise, the range is [a, b).
+        b: The exclusive upper bound of the range if specified.
 
     Returns:
-        The agreed-upon random integer within the range [0, upper_bound).
+        The agreed-upon random integer within the specified range.
     """
     upper_bound_bit_length = 3072
-    if upper_bound > 2**upper_bound_bit_length:
-        msg = f"{upper_bound}: The upper bound is too large."
-        raise ValueError(msg)
+    if b is None:
+        b = a
+        a = 0
+    if a < 0:
+        errmsg = "The lower bound is negative."
+        raise ValueError(errmsg)
+    if b > 2 ** upper_bound_bit_length:
+        errmsg = "The upper bound is too large."
+        raise ValueError(errmsg)
+    if a >= b:
+        errmsg = "The lower bound is greater than or equal to the upper bound."
+        raise ValueError(errmsg)
 
     world_size = communicator.world_size
     rank = communicator.rank
+    interval = b - a
 
     logging.debug("(%d): Agreeing on an integer...", rank)
 
-    # Generates a random integer.
-    integer = number.getRandomRange(0, upper_bound)
+    # Locally generates a random integer.
+    integer = number.getRandomRange(0, interval)
 
-    # Generates a commitment of the random integer.
+    # Computes the commitment of the locally generated random integer.
     hasher = sha256()
     hasher.update(integer.to_bytes(upper_bound_bit_length // 8, "big"))
     salt = number.getRandomNBitInteger(256)
-    hasher.update(salt.to_bytes(32, "big"))
+    hasher.update(salt.to_bytes(256 // 8, "big"))
     commitment = int.from_bytes(hasher.digest(), "big")
 
-    # Communicates the commitments of the random integer.
+    # Communicates the commitments of the locally generated random
+    # integers.
+    logging.debug("(%d): Communicating the commitments...", rank)
     data_list = communicator.all_to_all(
         {
             "type": "integer_commitment",
@@ -51,29 +64,25 @@ def agree_on_random_integer(
             "commitment": commitment,
         },
     )
-
+    logging.debug("(%d): Communicated the commitments.", rank)
     commitments: list[int] = [-1 for _ in range(world_size)]
     commitments[rank] = commitment
     for data in data_list:
         if not isinstance(data, dict):
             raise RuntimeError("An invalid message.")
-
         _type = data["type"]
         if not isinstance(_type, str):
             raise RuntimeError("An invalid message.")
         if _type != "integer_commitment":
             raise RuntimeError("An invalid message type.")
-
         opponent_rank = data["rank"]
         if not isinstance(opponent_rank, int):
             raise RuntimeError("An invalid message.")
         if opponent_rank < 0 or opponent_rank >= world_size:
             raise RuntimeError("An invalid message.")
-
         opponent_commitment = data["commitment"]
         if not isinstance(opponent_commitment, int):
             raise RuntimeError("An invalid message.")
-
         if commitments[opponent_rank] != -1:
             raise RuntimeError("An invalid message.")
         commitments[opponent_rank] = opponent_commitment
@@ -82,6 +91,7 @@ def agree_on_random_integer(
             raise RuntimeError("An invalid message.")
 
     # Communicates the random integers and the salts.
+    logging.debug("(%d): Communicating the random integers and salts...", rank)
     data_list = communicator.all_to_all(
         {
             "type": "integer_reveal",
@@ -90,6 +100,7 @@ def agree_on_random_integer(
             "salt": salt,
         },
     )
+    logging.debug("(%d): Communicated the random integers and salts.", rank)
 
     # Verifies the commitments of the random integers.
     integers: list[int] = [-1 for _ in range(world_size)]
@@ -110,7 +121,7 @@ def agree_on_random_integer(
         opponent_integer = data["integer"]
         if not isinstance(opponent_integer, int):
             raise RuntimeError("An invalid message.")
-        if opponent_integer < 0 or opponent_integer >= upper_bound:
+        if opponent_integer < 0 or opponent_integer >= b:
             raise RuntimeError("An invalid message.")
         opponent_salt = data["salt"]
         if not isinstance(opponent_salt, int):
@@ -120,20 +131,22 @@ def agree_on_random_integer(
         hasher.update(
             opponent_integer.to_bytes(upper_bound_bit_length // 8, "big")
         )
-        hasher.update(opponent_salt.to_bytes(32, "big"))
-        if hasher.digest() != commitments[opponent_rank].to_bytes(32, "big"):
+        hasher.update(opponent_salt.to_bytes(256 // 8, "big"))
+        if hasher.digest() != commitments[opponent_rank].to_bytes(256 // 8, "big"):
             raise RuntimeError("An invalid commitment.")
 
         integers[opponent_rank] = opponent_integer
+
+    # Computes the agreed-upon random integer.
     result = 0
     for i in integers:
         if i == -1:
             raise RuntimeError("An invalid message.")
-        result = (result + i) % upper_bound
+        result = (result + i) % interval
 
     logging.debug("(%d): Agreed on an integer.", rank)
 
-    return result
+    return a + result
 
 
 def agree_on_seats(communicator: Communicator) -> list[int]:
@@ -160,22 +173,21 @@ def agree_on_seats(communicator: Communicator) -> list[int]:
     # are determined by the composition of these permutations.
     permutations: list[list[int]] = [[] for _ in range(communicator.world_size)]
 
-    # Generates a permutation of seats and broadcast its
-    # commitment.
+    # Locally generates a permutation of seats.
     my_permutation = [i for i in range(communicator.world_size)]
     random.shuffle(my_permutation)
     permutations[communicator.rank] = my_permutation
 
-    # Generates a salt for the permutation of seats.
-    my_salt = number.getRandomNBitInteger(256)
-
-    # Generates a commitment of the permutation of seats.
+    # Computes the commitment of the locally generated permutation of
+    # seats.
     hasher = sha256()
     hasher.update(str(my_permutation).encode("UTF-8"))
-    hasher.update(my_salt.to_bytes(32, "big"))
+    my_salt = number.getRandomNBitInteger(256)
+    hasher.update(my_salt.to_bytes(256 // 8, "big"))
     my_commitment = int.from_bytes(hasher.digest(), "big")
 
-    # Communicates the commitments of the permutations of seats.
+    # Communicates the commitments of the locally generated
+    # permutations of seats.
     logging.debug(
         "(%d): Communicating seat permutation commitments...",
         communicator.rank,
@@ -212,7 +224,6 @@ def agree_on_seats(communicator: Communicator) -> list[int]:
         opponent_commitment = data["commitment"]
         if not isinstance(opponent_commitment, int):
             raise RuntimeError("An invalid message.")
-
         if commitments[opponent_rank] != -1:
             raise RuntimeError("An invalid message.")
         commitments[opponent_rank] = opponent_commitment
@@ -267,12 +278,11 @@ def agree_on_seats(communicator: Communicator) -> list[int]:
         opponent_salt = data["salt"]
         if not isinstance(opponent_salt, int):
             raise RuntimeError("An invalid message.")
-
         permutations[opponent_rank] = opponent_permutation
 
         hasher = sha256()
         hasher.update(str(opponent_permutation).encode("UTF-8"))
-        hasher.update(opponent_salt.to_bytes(32, "big"))
+        hasher.update(opponent_salt.to_bytes(256 // 8, "big"))
         if hasher.digest() != commitments[opponent_rank].to_bytes(32, "big"):
             raise RuntimeError("An invalid commitment.")
 

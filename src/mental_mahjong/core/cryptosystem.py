@@ -2,6 +2,7 @@ from hashlib import sha256
 import logging
 from multiprocessing import Process
 import random
+import time
 from typing import Final
 from Crypto.Util import number
 from mental_mahjong.core import (
@@ -20,29 +21,33 @@ class Cryptosystem:
     def _agree_on_key(self) -> None:
         L, _, p, _, _ = self._el_gamal.parameters
 
-        # Each player generates their individual private key and the
-        # corresponding public key.
-        self._my_private_key, my_public_key = ElGamal().generate_key_pair()
+        # Each player generates their local private key and the
+        # corresponding local public key.
+        self._my_private_key, my_public_key = (
+            self._el_gamal.generate_key_pair()
+        )
 
-        # Generates the commitment of my public key.
+        # Generates the commitment of the local public key.
         hasher = sha256()
         hasher.update(my_public_key.to_bytes(L // 8, "big"))
+        my_salt = number.getRandomNBitInteger(256)
+        hasher.update(my_salt.to_bytes(256 // 8, "big"))
         my_commitment = int.from_bytes(hasher.digest(), "big")
 
-        # Communicates the commitments of the distributed public key.
+        # Communicates the commitments of the local public key.
         logging.debug(
             "(%d): Communicating the commitments of individual public keys...",
             self._communicator.rank,
         )
         data_list = self._communicator.all_to_all(
             {
-                "type": "public_key_commitment",
+                "type": "DistributedCryptosystem._agree_on_key.commitment",
                 "rank": self._communicator.rank,
                 "commitment": my_commitment,
             },
         )
         logging.debug(
-            "(%d): Communicated my public key commitment.",
+            "(%d): Communicated the commitments of individual public keys.",
             self._communicator.rank,
         )
 
@@ -58,7 +63,157 @@ class Cryptosystem:
             _type = data["type"]
             if not isinstance(_type, str):
                 raise RuntimeError("An invalid message.")
-            if _type != "public_key_commitment":
+            if _type != "DistributedCryptosystem._agree_on_key.commitment":
+                raise RuntimeError("An invalid message.")
+            if "rank" not in data:
+                raise RuntimeError("An invalid message.")
+            opponent_rank = data["rank"]
+            if not isinstance(opponent_rank, int):
+                raise RuntimeError("An invalid message.")
+            if "commitment" not in data:
+                raise RuntimeError("An invalid message.")
+            opponent_commitment = data["commitment"]
+            if not isinstance(opponent_commitment, int):
+                raise RuntimeError("An invalid message.")
+            if commitments[opponent_rank] != -1:
+                raise RuntimeError("An invalid message.")
+            commitments[opponent_rank] = opponent_commitment
+        for c in commitments:
+            if c == -1:
+                errmsg = "An invalid message."
+                raise RuntimeError(errmsg)
+
+        # Communicates the local public keys.
+        logging.debug(
+            "(%d): Communicating the individual public keys...",
+            self._communicator.rank,
+        )
+        data_list = self._communicator.all_to_all(
+            {
+                "type": "DistributedCryptosystem._agree_on_key.reveal",
+                "rank": self._communicator.rank,
+                "public_key": my_public_key,
+                "salt": my_salt,
+            },
+        )
+        logging.debug(
+            "(%d): Communicated the individual public keys.",
+            self._communicator.rank,
+        )
+
+        # Verifies the commitments of the local public keys.
+        self._individual_public_keys: list[int] = [
+            -1 for _ in range(self._communicator.world_size)
+        ]
+        self._individual_public_keys[self._communicator.rank] = my_public_key
+        for data in data_list:
+            if not isinstance(data, dict):
+                raise RuntimeError("An invalid message.")
+            if "type" not in data:
+                raise RuntimeError("An invalid message.")
+            _type = data["type"]
+            if not isinstance(_type, str):
+                raise RuntimeError("An invalid message.")
+            if _type != "DistributedCryptosystem._agree_on_key.reveal":
+                raise RuntimeError("An invalid message.")
+            if "rank" not in data:
+                raise RuntimeError("An invalid message.")
+            opponent_rank = data["rank"]
+            if not isinstance(opponent_rank, int):
+                raise RuntimeError("An invalid message.")
+            if "public_key" not in data:
+                raise RuntimeError("An invalid message.")
+            opponent_public_key = data["public_key"]
+            if not isinstance(opponent_public_key, int):
+                raise RuntimeError("An invalid message.")
+            if "salt" not in data:
+                raise RuntimeError("An invalid message.")
+            opponent_salt = data["salt"]
+            if not isinstance(opponent_salt, int):
+                raise RuntimeError("An invalid message.")
+
+            hasher = sha256()
+            hasher.update(opponent_public_key.to_bytes(L // 8, "big"))
+            hasher.update(opponent_salt.to_bytes(256 // 8, "big"))
+            if hasher.digest() != commitments[opponent_rank].to_bytes(
+                256 // 8, "big"
+            ):
+                raise RuntimeError("An invalid commitment.")
+
+            if self._individual_public_keys[opponent_rank] != -1:
+                raise RuntimeError("An invalid message.")
+            self._individual_public_keys[opponent_rank] = opponent_public_key
+
+        # Computes the global public key.
+        self._global_public_key = 1
+        for individual_public_key in self._individual_public_keys:
+            if individual_public_key == -1:
+                raise RuntimeError(
+                    "Failed to communicate an opponent's public key."
+                )
+            self._global_public_key = (
+                self._global_public_key * individual_public_key
+            ) % p
+
+    def __init__(self, communicator: Communicator, L: int) -> None:
+        self._communicator = communicator
+        self._el_gamal = ElGamal(L)
+
+        self._agree_on_key()
+
+    @property
+    def parameters(self) -> ElGamalParameters:
+        return self._el_gamal.parameters
+
+    @property
+    def communicator(self) -> Communicator:
+        return self._communicator
+
+    @property
+    def global_public_key(self) -> int:
+        return self._global_public_key
+
+    def plaintext_equality_test(
+        self,
+        ciphertext0: ElGamalCiphertext,
+        ciphertext1: ElGamalCiphertext,
+    ) -> bool:
+        logging.debug(
+            "(%d): Executing a plaintext equality test...",
+            self._communicator.rank,
+        )
+
+        _, _, p, q, g = self._el_gamal.parameters
+
+        a0, b0 = ciphertext0
+        a1, b1 = ciphertext1
+        epsilon = (a0 * number.inverse(a1, p)) % p
+        zeta = (b0 * number.inverse(b1, p)) % p
+
+        z = number.getRandomRange(0, q)
+        r = number.getRandomRange(0, q)
+        commitment = (pow(g, z, p) * pow(self._global_public_key, r, p)) % p
+
+        data_list = self._communicator.all_to_all(
+            {
+                "type": "plaintext_equality_test_commitment",
+                "rank": self._communicator.rank,
+                "commitment": commitment,
+            },
+        )
+        commitments: list[int] = [
+            -1 for _ in range(self._communicator.world_size)
+        ]
+        commitments[self._communicator.rank] = commitment
+        for data in data_list:
+            if not isinstance(data, dict):
+                raise RuntimeError("An invalid message.")
+            if "type" not in data:
+                raise RuntimeError("An invalid message.")
+            _type = data["type"]
+            if not isinstance(_type, str):
+                raise RuntimeError("An invalid message.")
+            if _type != "plaintext_equality_test_commitment":
                 raise RuntimeError("An invalid message type.")
             if "rank" not in data:
                 raise RuntimeError("An invalid message.")
@@ -74,29 +229,23 @@ class Cryptosystem:
             if commitments[opponent_rank] != -1:
                 raise RuntimeError("An invalid message.")
             commitments[opponent_rank] = opponent_commitment
+        for c in commitments:
+            if c == -1:
+                raise RuntimeError("An invalid message.")
 
-        # Communicates the individual public keys.
-        logging.debug(
-            "(%d): Communicating the individual public keys...",
-            self._communicator.rank,
-        )
+        # TODO: Implement the rest of the protocol.
+
         data_list = self._communicator.all_to_all(
             {
-                "type": "public_key_reveal",
+                "type": "plaintext_equality_test_ciphertext",
                 "rank": self._communicator.rank,
-                "public_key": my_public_key,
+                "ciphertext": [epsilon, zeta],
             },
         )
-        logging.debug(
-            "(%d): Communicated the individual public keys.",
-            self._communicator.rank,
-        )
-
-        # Verifies the commitments of the distributed public keys.
-        self._individual_public_keys: list[int] = [
-            -1 for _ in range(self._communicator.world_size)
+        ciphertexts: list[ElGamalCiphertext] = [
+            (-1, -1) for _ in range(self._communicator.world_size)
         ]
-        self._individual_public_keys[self._communicator.rank] = my_public_key
+        ciphertexts[self._communicator.rank] = (epsilon, zeta)
         for data in data_list:
             if not isinstance(data, dict):
                 raise RuntimeError("An invalid message.")
@@ -105,57 +254,42 @@ class Cryptosystem:
             _type = data["type"]
             if not isinstance(_type, str):
                 raise RuntimeError("An invalid message.")
-            if _type != "public_key_reveal":
+            if _type != "plaintext_equality_test_ciphertext":
                 raise RuntimeError("An invalid message type.")
             if "rank" not in data:
                 raise RuntimeError("An invalid message.")
             opponent_rank = data["rank"]
             if not isinstance(opponent_rank, int):
                 raise RuntimeError("An invalid message.")
-            if "public_key" not in data:
+            if "ciphertext" not in data:
                 raise RuntimeError("An invalid message.")
-            opponent_public_key = data["public_key"]
-            if not isinstance(opponent_public_key, int):
+            opponent_ciphertext = data["ciphertext"]
+            if not isinstance(opponent_ciphertext, list):
+                raise RuntimeError("An invalid message.")
+            if len(opponent_ciphertext) != 2:
+                raise RuntimeError("An invalid message.")
+            epsilon, zeta = opponent_ciphertext
+            if not isinstance(epsilon, int):
+                raise RuntimeError("An invalid message.")
+            if not isinstance(zeta, int):
                 raise RuntimeError("An invalid message.")
 
-            hasher = sha256()
-            hasher.update(opponent_public_key.to_bytes(L // 8, "big"))
-            if hasher.digest() != commitments[opponent_rank].to_bytes(
-                32, "big"
-            ):
-                raise RuntimeError("An invalid commitment.")
-
-            if self._individual_public_keys[opponent_rank] != -1:
+            if ciphertexts[opponent_rank] != (-1, -1):
                 raise RuntimeError("An invalid message.")
-            self._individual_public_keys[opponent_rank] = opponent_public_key
+            ciphertexts[opponent_rank] = (epsilon, zeta)
 
-        self._global_public_key = 1
-        for individual_public_key in self._individual_public_keys:
-            if individual_public_key == -1:
-                raise RuntimeError(
-                    "Failed to communicate an opponent's public key."
-                )
-            self._global_public_key = (
-                self._global_public_key * individual_public_key
-            ) % p
+        ciphertext: ElGamalCiphertext = (1, 1)
+        for a, b in ciphertexts:
+            ciphertext = ((ciphertext[0] * a) % p, (ciphertext[1] * b) % p)
 
-    def __init__(self, communicator: Communicator) -> None:
-        self._communicator = communicator
-        self._el_gamal = ElGamal()
+        plaintext = self.decrypt_publicly(ciphertext)
 
-        self._agree_on_key()
+        logging.debug(
+            "(%d): Executed a plaintext equality test.",
+            self._communicator.rank,
+        )
 
-    @property
-    def parameters(self) -> ElGamalParameters:
-        return self._el_gamal.parameters
-
-    @property
-    def communicator(self) -> Communicator:
-        return self._communicator
-
-    @property
-    def global_public_key(self) -> int:
-        return self._global_public_key
+        return plaintext == 1
 
     def _chaum_pedersen_1993(
         self, prover_rank: int, verifier_rank: int, a: int, b: int
@@ -387,1172 +521,36 @@ class Cryptosystem:
 
         return result
 
-    def encrypt(self, m: int) -> tuple[ElGamalCiphertext, int]:
+    def encrypt(
+        self, m: int, nonce: int | None = None
+    ) -> tuple[ElGamalCiphertext, int]:
         _, _, p, q, _ = self._el_gamal.parameters
         if m <= 0 or m >= p:
-            errmsg = "The plaintext must be in the range [0, p)."
+            errmsg = "The plaintext must be in the range (0, p)."
+            raise ValueError(errmsg)
+        if nonce is not None and (nonce < 0 or nonce >= q):
+            errmsg = "The nonce must be in the range [0, q)."
             raise ValueError(errmsg)
 
-        nonce = agree_on_random_integer(self._communicator, q)
+        if nonce is None:
+            nonce = agree_on_random_integer(self._communicator, q)
+
         return self._el_gamal.encrypt(self._global_public_key, m, nonce)
 
-    def _plaintext_equivalence_proof(
-        self,
-        prover_rank: int,
-        original_ciphertext: ElGamalCiphertext,
-        reencrypted_ciphertext: ElGamalCiphertext,
-        nonce: int | None,
-    ) -> bool:
-        if prover_rank < 0 or prover_rank >= self._communicator.world_size:
-            msg = f"{prover_rank}: An invalid rank."
-            raise ValueError(msg)
-        if (prover_rank == self._communicator.rank) != (nonce is not None):
-            msg = "An invalid argument."
-            raise ValueError(msg)
-
-        logging.debug(
-            "(%d): Executing a plaintext equivalence proof...",
-            self._communicator.rank,
-        )
-
-        L, N, p, _, g = self._el_gamal.parameters
-        a0, b0 = original_ciphertext
-        a1, b1 = reencrypted_ciphertext
-        a = (a1 * number.inverse(a0, p)) % p
-        b = (b1 * number.inverse(b0, p)) % p
-
-        z = agree_on_random_integer(self._communicator, 2**L)
-        gg = (pow(self._global_public_key, z, p) * g) % p
-        yy = (pow(b, z, p) * a) % p
-
-        if prover_rank == self._communicator.rank:
-            assert nonce is not None
-
-            e = number.getRandomRange(0, 2**N)
-            w = pow(gg, e, p)
-
-            logging.debug(
-                "(%d): Broadcasting a commitment for plaintext equivalence proof...",
-                self._communicator.rank,
-            )
-            self._communicator.broadcast(
-                {
-                    "type": "plaintext_equivalence_proof_commitment",
-                    "rank": self._communicator.rank,
-                    "commitment": w,
-                }
-            )
-            logging.debug(
-                "(%d): Broadcasted a commitment for plaintext equivalence proof.",
-                self._communicator.rank,
-            )
-
-            logging.debug(
-                "(%d): Receiving challenges for plaintext equivalence proof...",
-                self._communicator.rank,
-            )
-            data_list = self._communicator.gather()
-            logging.debug(
-                "(%d): Received challenges for plaintext equivalence proof.",
-                self._communicator.rank,
-            )
-            challenges: list[int] = []
-            for data in data_list:
-                if not isinstance(data, dict):
-                    raise RuntimeError("An invalid message.")
-                if "type" not in data:
-                    raise RuntimeError("An invalid message.")
-                _type = data["type"]
-                if not isinstance(_type, str):
-                    raise RuntimeError("An invalid message.")
-                if _type != "plaintext_equivalence_proof_challenge":
-                    raise RuntimeError("An invalid message type.")
-                if "rank" not in data:
-                    raise RuntimeError("An invalid message.")
-                opponent_rank = data["rank"]
-                if not isinstance(opponent_rank, int):
-                    raise RuntimeError("An invalid message.")
-                if "challenge" not in data:
-                    raise RuntimeError("An invalid message.")
-                challenge = data["challenge"]
-                if not isinstance(challenge, int):
-                    raise RuntimeError("An invalid message.")
-                challenges.append(challenge)
-
-            responses: list[dict] = []
-            for challenge in challenges:
-                response = (nonce * challenge + e) % p
-                responses.append(
-                    {
-                        "type": "plaintext_equivalence_proof_response",
-                        "rank": self._communicator.rank,
-                        "response": response,
-                    },
-                )
-
-            logging.debug(
-                "(%d): Sending responses for plaintext equivalence proof...",
-                self._communicator.rank,
-            )
-            self._communicator.send_each_element(responses)
-            logging.debug(
-                "(%d): Sent responses for plaintext equivalence proof.",
-                self._communicator.rank,
-            )
-
-            logging.debug(
-                "(%d): Communicating the result of plaintext equivalence proof...",
-                self._communicator.rank,
-            )
-            data_list = self._communicator.all_to_all(
-                {
-                    "type": "plaintext_equivalence_proof_result",
-                    "rank": self._communicator.rank,
-                    "result": True,
-                },
-            )
-            logging.debug(
-                "(%d): Communicated the result of plaintext equivalence proof.",
-                self._communicator.rank,
-            )
-            result = True
-            for data in data_list:
-                if not isinstance(data, dict):
-                    raise RuntimeError("An invalid message.")
-                if "type" not in data:
-                    raise RuntimeError("An invalid message.")
-                _type = data["type"]
-                if not isinstance(_type, str):
-                    raise RuntimeError("An invalid message.")
-                if _type != "plaintext_equivalence_proof_result":
-                    raise RuntimeError("An invalid message type.")
-                if "rank" not in data:
-                    raise RuntimeError("An invalid message.")
-                opponent_rank = data["rank"]
-                if not isinstance(opponent_rank, int):
-                    raise RuntimeError("An invalid message.")
-                if "result" not in data:
-                    raise RuntimeError("An invalid message.")
-                result = data["result"]
-                if not isinstance(result, bool):
-                    raise RuntimeError("An invalid message.")
-                if not result:
-                    result = False
-
-            logging.debug(
-                "(%d): Executed a plaintext equivalence proof.",
-                self._communicator.rank,
-            )
-
-            return result
-
-        logging.debug(
-            "(%d): Receiving a commitment for plaintext equivalence proof...",
-            self._communicator.rank,
-        )
-        data = self._communicator.recv(prover_rank)
-        logging.debug(
-            "(%d): Received a commitment for plaintext equivalence proof.",
-            self._communicator.rank,
-        )
-        if not isinstance(data, dict):
-            raise RuntimeError("An invalid message.")
-        if "type" not in data:
-            raise RuntimeError("An invalid message.")
-        _type = data["type"]
-        if not isinstance(_type, str):
-            raise RuntimeError("An invalid message.")
-        if _type != "plaintext_equivalence_proof_commitment":
-            raise RuntimeError("An invalid message type.")
-        if "rank" not in data:
-            raise RuntimeError("An invalid message.")
-        opponent_rank = data["rank"]
-        if not isinstance(opponent_rank, int):
-            raise RuntimeError("An invalid message.")
-        if opponent_rank != prover_rank:
-            raise RuntimeError("An invalid message.")
-        if "commitment" not in data:
-            raise RuntimeError("An invalid message.")
-        w = data["commitment"]
-        if not isinstance(w, int):
-            raise RuntimeError("An invalid message.")
-
-        challenge = number.getRandomNBitInteger(_CHALLENGE_BIT_LENGTH)
-        logging.debug(
-            "(%d): Sending a challenge for plaintext equivalence proof...",
-            self._communicator.rank,
-        )
-        self._communicator.send(
-            prover_rank,
-            {
-                "type": "plaintext_equivalence_proof_challenge",
-                "rank": self._communicator.rank,
-                "challenge": challenge,
-            },
-        )
-        logging.debug(
-            "(%d): Sent a challenge for plaintext equivalence proof.",
-            self._communicator.rank,
-        )
-
-        logging.debug(
-            "(%d): Receiving a response for plaintext equivalence proof...",
-            self._communicator.rank,
-        )
-        data = self._communicator.recv(prover_rank)
-        logging.debug(
-            "(%d): Received a response for plaintext equivalence proof.",
-            self._communicator.rank,
-        )
-        if not isinstance(data, dict):
-            raise RuntimeError("An invalid message.")
-        if "type" not in data:
-            raise RuntimeError("An invalid message.")
-        _type = data["type"]
-        if not isinstance(_type, str):
-            raise RuntimeError("An invalid message.")
-        if _type != "plaintext_equivalence_proof_response":
-            raise RuntimeError("An invalid message type.")
-        if "rank" not in data:
-            raise RuntimeError("An invalid message.")
-        opponent_rank = data["rank"]
-        if not isinstance(opponent_rank, int):
-            raise RuntimeError("An invalid message.")
-        if opponent_rank != prover_rank:
-            raise RuntimeError("An invalid message.")
-        if "response" not in data:
-            raise RuntimeError("An invalid message.")
-        s = data["response"]
-        if not isinstance(s, int):
-            raise RuntimeError("An invalid message.")
-
-        result = pow(gg, s, p) == (w * pow(yy, challenge, p)) % p
-
-        logging.debug(
-            "(%d): Communicating the result of plaintext equivalence proof...",
-            self._communicator.rank,
-        )
-        data_list = self._communicator.all_to_all(
-            {
-                "type": "plaintext_equivalence_proof_result",
-                "rank": self._communicator.rank,
-                "result": result,
-            },
-        )
-        logging.debug(
-            "(%d): Communicated the result of plaintext equivalence proof.",
-            self._communicator.rank,
-        )
-        result = True
-        for data in data_list:
-            if not isinstance(data, dict):
-                raise RuntimeError("An invalid message.")
-            if "type" not in data:
-                raise RuntimeError("An invalid message.")
-            _type = data["type"]
-            if not isinstance(_type, str):
-                raise RuntimeError("An invalid message.")
-            if _type != "plaintext_equivalence_proof_result":
-                raise RuntimeError("An invalid message type.")
-            if "rank" not in data:
-                raise RuntimeError("An invalid message.")
-            opponent_rank = data["rank"]
-            if not isinstance(opponent_rank, int):
-                raise RuntimeError("An invalid message.")
-            if "result" not in data:
-                raise RuntimeError("An invalid message.")
-            result = data["result"]
-            if not isinstance(result, bool):
-                raise RuntimeError("An invalid message.")
-            if not result:
-                result = False
-
-        logging.debug(
-            "(%d): Executed a plaintext equivalence proof.",
-            self._communicator.rank,
-        )
-
-        return result
-
-    def _disjunctive_schnorr_identification_protocol(
-        self,
-        prover_rank: int,
-        gg0: int,
-        yy0: int,
-        nonce0: int | None,
-        gg1: int,
-        yy1: int,
-        nonce1: int | None,
-    ) -> bool:
-        if prover_rank < 0 or prover_rank >= self._communicator.world_size:
-            msg = f"{prover_rank}: An invalid rank."
-            raise ValueError(msg)
-        if (prover_rank == self._communicator.rank) != (
-            nonce0 is not None or nonce1 is not None
-        ):
-            msg = "An invalid argument."
-            raise ValueError(msg)
-        if nonce0 is not None and nonce1 is not None:
-            msg = "An invalid argument."
-            raise ValueError(msg)
-
-        logging.debug(
-            "(%d): Executing disjunctive Schnorr identification protocol...",
-            self._communicator.rank,
-        )
-
-        _, _, p, q, _ = self._el_gamal.parameters
-
-        if prover_rank == self._communicator.rank:
-            assert nonce0 is not None or nonce1 is not None
-
-            challenges: list[int]
-            responses: list[dict]
-
-            if nonce0 is not None:
-                assert nonce1 is None
-
-                e0 = number.getRandomRange(1, q)
-                s1 = number.getRandomRange(1, q)
-                c1 = number.getRandomNBitInteger(_CHALLENGE_BIT_LENGTH)
-                w0 = pow(gg0, e0, p)
-                w1 = (number.inverse(pow(gg1, s1, p), p) * pow(yy1, c1, p)) % p
-
-                logging.debug(
-                    "(%d): Broadcasting commitments for disjunctive Schnorr identification protocol...",
-                    self._communicator.rank,
-                )
-                self._communicator.broadcast(
-                    {
-                        "type": "disjunctive_schnorr_identification_protocol_commitments",
-                        "rank": prover_rank,
-                        "commitments": [w0, w1],
-                    },
-                )
-                logging.debug(
-                    "(%d): Broadcasted commitments for disjunctive Schnorr identification protocol.",
-                    self._communicator.rank,
-                )
-
-                logging.debug(
-                    "(%d): Receiving challenges for disjunctive Schnorr identification protocol...",
-                    self._communicator.rank,
-                )
-                data_list = self._communicator.gather()
-                logging.debug(
-                    "(%d): Received challenges for disjunctive Schnorr identification protocol.",
-                    self._communicator.rank,
-                )
-                challenges = []
-                for data in data_list:
-                    if not isinstance(data, dict):
-                        raise RuntimeError("An invalid message.")
-                    if "type" not in data:
-                        raise RuntimeError("An invalid message.")
-                    _type = data["type"]
-                    if not isinstance(_type, str):
-                        raise RuntimeError("An invalid message.")
-                    if (
-                        _type
-                        != "disjunctive_schnorr_identification_protocol_challenge"
-                    ):
-                        raise RuntimeError("An invalid message type.")
-                    if "rank" not in data:
-                        raise RuntimeError("An invalid message.")
-                    opponent_rank = data["rank"]
-                    if not isinstance(opponent_rank, int):
-                        raise RuntimeError("An invalid message.")
-                    if "challenge" not in data:
-                        raise RuntimeError("An invalid message.")
-                    challenge = data["challenge"]
-                    if not isinstance(challenge, int):
-                        raise RuntimeError("An invalid message.")
-                    challenges.append(challenge)
-
-                responses = []
-                for c in challenges:
-                    if not isinstance(c, int):
-                        raise RuntimeError("An invalid message.")
-                    c0 = (c ^ c1) % q
-                    s0 = ((c0 * nonce0) % q + (q - e0)) % q
-                    response = [s0, s1, c0, c1]
-                    responses.append(
-                        {
-                            "type": "disjunctive_schnorr_identification_protocol_response",
-                            "rank": prover_rank,
-                            "response": response,
-                        },
-                    )
-
-                logging.debug(
-                    "(%d): Sending responses for disjunctive Schnorr identification protocol...",
-                    self._communicator.rank,
-                )
-                self._communicator.send_each_element(responses)
-                logging.debug(
-                    "(%d): Sent responses for disjunctive Schnorr identification protocol.",
-                    self._communicator.rank,
-                )
-            else:
-                assert nonce1 is not None
-
-                e1 = number.getRandomRange(0, q)
-                s0 = number.getRandomRange(0, q)
-                c0 = number.getRandomNBitInteger(_CHALLENGE_BIT_LENGTH)
-                w0 = (number.inverse(pow(gg0, s0, p), p) * pow(yy0, c0, p)) % p
-                w1 = pow(gg1, e1, p)
-
-                logging.debug(
-                    "(%d): Broadcasting commitments for disjunctive Schnorr identification protocol...",
-                    self._communicator.rank,
-                )
-                self._communicator.broadcast(
-                    {
-                        "type": "disjunctive_schnorr_identification_protocol_commitments",
-                        "rank": prover_rank,
-                        "commitments": [w0, w1],
-                    },
-                )
-                logging.debug(
-                    "(%d): Broadcasted commitments for disjunctive Schnorr identification protocol.",
-                    self._communicator.rank,
-                )
-
-                logging.debug(
-                    "(%d): Receiving challenges for disjunctive Schnorr identification protocol...",
-                    self._communicator.rank,
-                )
-                data_list = self._communicator.gather()
-                logging.debug(
-                    "(%d): Received challenges for disjunctive Schnorr identification protocol.",
-                    self._communicator.rank,
-                )
-                challenges = []
-                for data in data_list:
-                    if not isinstance(data, dict):
-                        raise RuntimeError("An invalid message.")
-                    if "type" not in data:
-                        raise RuntimeError("An invalid message.")
-                    _type = data["type"]
-                    if not isinstance(_type, str):
-                        raise RuntimeError("An invalid message.")
-                    if (
-                        _type
-                        != "disjunctive_schnorr_identification_protocol_challenge"
-                    ):
-                        raise RuntimeError("An invalid message type.")
-                    if "rank" not in data:
-                        raise RuntimeError("An invalid message.")
-                    opponent_rank = data["rank"]
-                    if not isinstance(opponent_rank, int):
-                        raise RuntimeError("An invalid message.")
-                    if "challenge" not in data:
-                        raise RuntimeError("An invalid message.")
-                    challenge = data["challenge"]
-                    if not isinstance(challenge, int):
-                        raise RuntimeError("An invalid message.")
-                    challenges.append(challenge)
-
-                responses = []
-                for c in challenges:
-                    if not isinstance(c, int):
-                        raise RuntimeError("An invalid message.")
-                    c1 = (c ^ c0) % q
-                    s1 = ((c1 * nonce1) % q + (q - e1)) % q
-                    response = [s0, s1, c0, c1]
-                    responses.append(
-                        {
-                            "type": "disjunctive_schnorr_identification_protocol_response",
-                            "rank": prover_rank,
-                            "response": response,
-                        },
-                    )
-
-                logging.debug(
-                    "(%d): Sending responses for disjunctive Schnorr identification protocol...",
-                    self._communicator.rank,
-                )
-                self._communicator.send_each_element(responses)
-                logging.debug(
-                    "(%d): Sent responses for disjunctive Schnorr identification protocol.",
-                    self._communicator.rank,
-                )
-
-            logging.debug(
-                "(%d): Communicating the result of disjunctive Schnorr identification protocol...",
-                self._communicator.rank,
-            )
-            data_list = self._communicator.all_to_all(
-                {
-                    "type": "disjunctive_schnorr_identification_protocol_result",
-                    "rank": self._communicator.rank,
-                    "result": True,
-                },
-            )
-            logging.debug(
-                "(%d): Communicated the result of disjunctive Schnorr identification protocol.",
-                self._communicator.rank,
-            )
-            result = True
-            for data in data_list:
-                if not isinstance(data, dict):
-                    raise RuntimeError("An invalid message.")
-                if "type" not in data:
-                    raise RuntimeError("An invalid message.")
-                _type = data["type"]
-                if not isinstance(_type, str):
-                    raise RuntimeError("An invalid message.")
-                if (
-                    _type
-                    != "disjunctive_schnorr_identification_protocol_result"
-                ):
-                    raise RuntimeError("An invalid message type.")
-                if "rank" not in data:
-                    raise RuntimeError("An invalid message.")
-                opponent_rank = data["rank"]
-                if not isinstance(opponent_rank, int):
-                    raise RuntimeError("An invalid message.")
-                if "result" not in data:
-                    raise RuntimeError("An invalid message.")
-                result = data["result"]
-                if not isinstance(result, bool):
-                    raise RuntimeError("An invalid message.")
-                if not result:
-                    result = False
-
-            logging.debug(
-                "(%d): Executed disjunctive Schnorr identification protocol.",
-                self._communicator.rank,
-            )
-
-            return result
-
-        assert nonce0 is None
-        assert nonce1 is None
-
-        logging.debug(
-            "(%d): Receiving commitments for disjunctive Schnorr identification protocol...",
-            self._communicator.rank,
-        )
-        data = self._communicator.recv(prover_rank)
-        logging.debug(
-            "(%d): Received commitments for disjunctive Schnorr identification protocol.",
-            self._communicator.rank,
-        )
-        if not isinstance(data, dict):
-            raise RuntimeError("An invalid message.")
-        if "type" not in data:
-            raise RuntimeError("An invalid message.")
-        _type = data["type"]
-        if not isinstance(_type, str):
-            raise RuntimeError("An invalid message.")
-        if _type != "disjunctive_schnorr_identification_protocol_commitments":
-            raise RuntimeError("An invalid message type.")
-        if "rank" not in data:
-            raise RuntimeError("An invalid message.")
-        opponent_rank = data["rank"]
-        if not isinstance(opponent_rank, int):
-            raise RuntimeError("An invalid message.")
-        if opponent_rank != prover_rank:
-            raise RuntimeError("An invalid message.")
-        if "commitments" not in data:
-            raise RuntimeError("An invalid message.")
-        commitments = data["commitments"]
-        if not isinstance(commitments, list):
-            raise RuntimeError("An invalid message.")
-        if len(commitments) != 2:
-            raise RuntimeError("An invalid message.")
-        w0, w1 = commitments
-        if not isinstance(w0, int):
-            raise RuntimeError("An invalid message.")
-        if not isinstance(w1, int):
-            raise RuntimeError("An invalid message.")
-
-        challenge = number.getRandomNBitInteger(_CHALLENGE_BIT_LENGTH)
-
-        logging.debug(
-            "(%d): Sending a challenge for disjunctive Schnorr identification protocol...",
-            self._communicator.rank,
-        )
-        self._communicator.send(
-            prover_rank,
-            {
-                "type": "disjunctive_schnorr_identification_protocol_challenge",
-                "rank": prover_rank,
-                "challenge": challenge,
-            },
-        )
-        logging.debug(
-            "(%d): Sent a challenge for disjunctive Schnorr identification protocol.",
-            self._communicator.rank,
-        )
-
-        logging.debug(
-            "(%d): Receiving a response for disjunctive Schnorr identification protocol...",
-            self._communicator.rank,
-        )
-        data = self._communicator.recv(prover_rank)
-        logging.debug(
-            "(%d): Received a response for disjunctive Schnorr identification protocol.",
-            self._communicator.rank,
-        )
-        if not isinstance(data, dict):
-            raise RuntimeError("An invalid message.")
-        if "type" not in data:
-            raise RuntimeError("An invalid message.")
-        _type = data["type"]
-        if not isinstance(_type, str):
-            raise RuntimeError("An invalid message.")
-        if _type != "disjunctive_schnorr_identification_protocol_response":
-            raise RuntimeError("An invalid message type.")
-        if "rank" not in data:
-            raise RuntimeError("An invalid message.")
-        opponent_rank = data["rank"]
-        if not isinstance(opponent_rank, int):
-            raise RuntimeError("An invalid message.")
-        if opponent_rank != prover_rank:
-            raise RuntimeError("An invalid message.")
-        if "response" not in data:
-            raise RuntimeError("An invalid message.")
-        response = data["response"]
-        if not isinstance(response, list):
-            msg = f"{type(response)}: An invalid message."
-            raise RuntimeError(msg)
-        if len(response) != 4:
-            msg = f"{len(response)}: An invalid message."
-            raise RuntimeError(msg)
-        s0, s1, c0, c1 = response
-        if not isinstance(s0, int):
-            raise RuntimeError("An invalid message.")
-        if not isinstance(s1, int):
-            raise RuntimeError("An invalid message.")
-        if not isinstance(c0, int):
-            raise RuntimeError("An invalid message.")
-        if not isinstance(c1, int):
-            raise RuntimeError("An invalid message.")
-
-        result = True
-        if pow(yy0, c0, p) != (pow(gg0, s0, p) * w0) % p:
-            result = False
-        if pow(yy1, c1, p) != (pow(gg1, s1, p) * w1) % p:
-            result = False
-
-        logging.debug(
-            "(%d): Communicating the result of disjunctive Schnorr identification protocol...",
-            self._communicator.rank,
-        )
-        data_list = self._communicator.all_to_all(
-            {
-                "type": "disjunctive_schnorr_identification_protocol_result",
-                "rank": self._communicator.rank,
-                "result": result,
-            },
-        )
-        logging.debug(
-            "(%d): Communicated the result of disjunctive Schnorr identification protocol.",
-            self._communicator.rank,
-        )
-        for data in data_list:
-            if not isinstance(data, dict):
-                raise RuntimeError("An invalid message.")
-            if "type" not in data:
-                raise RuntimeError("An invalid message.")
-            _type = data["type"]
-            if not isinstance(_type, str):
-                raise RuntimeError("An invalid message.")
-            if _type != "disjunctive_schnorr_identification_protocol_result":
-                raise RuntimeError("An invalid message type.")
-            if "rank" not in data:
-                raise RuntimeError("An invalid message.")
-            opponent_rank = data["rank"]
-            if not isinstance(opponent_rank, int):
-                raise RuntimeError("An invalid message.")
-            if "result" not in data:
-                raise RuntimeError("An invalid message.")
-            result = data["result"]
-            if not isinstance(result, bool):
-                raise RuntimeError("An invalid message.")
-            if not result:
-                logging.debug(
-                    "(%d): Executed disjunctive Schnorr identification protocol.",
-                    self._communicator.rank,
-                )
-                return False
-
-        logging.debug(
-            "(%d): Executed disjunctive Schnorr identification protocol.",
-            self._communicator.rank,
-        )
-        return result
-
-    def _disjunctive_plaintext_equivalence_proof(
-        self,
-        prover_rank: int,
-        reencrypted_ciphertext: ElGamalCiphertext,
-        ciphertext0: ElGamalCiphertext,
-        nonce0: int | None,
-        ciphertext1: ElGamalCiphertext,
-        nonce1: int | None,
-    ) -> bool:
-        if prover_rank < 0 or prover_rank >= self._communicator.world_size:
-            msg = f"{prover_rank}: An invalid rank."
-            raise ValueError(msg)
-        if (prover_rank == self._communicator.rank) != (
-            nonce0 is not None or nonce1 is not None
-        ):
-            msg = "An invalid argument."
-            raise ValueError(msg)
-        if nonce0 is not None and nonce1 is not None:
-            msg = "An invalid argument."
-            raise ValueError(msg)
-
-        logging.debug(
-            "(%d): Executing disjunctive plaintext equivalence proof...",
-            self._communicator.rank,
-        )
-
-        L, _, p, _, g = self._el_gamal.parameters
-        aa0, bb0 = reencrypted_ciphertext
-        aa1, bb1 = ciphertext0
-        aa2, bb2 = ciphertext1
-
-        a1 = (aa0 * number.inverse(aa1, p)) % p
-        b1 = (bb0 * number.inverse(bb1, p)) % p
-        a2 = (aa0 * number.inverse(aa2, p)) % p
-        b2 = (bb0 * number.inverse(bb2, p)) % p
-
-        z0 = agree_on_random_integer(self._communicator, 2**L)
-        gg0 = (pow(self._global_public_key, z0, p) * g) % p
-        yy0 = (pow(b1, z0, p) * a1) % p
-        if nonce0 is not None:
-            assert pow(gg0, nonce0, p) == yy0
-
-        z1 = agree_on_random_integer(self._communicator, 2**L)
-        gg1 = (pow(self._global_public_key, z1, p) * g) % p
-        yy1 = (pow(b2, z1, p) * a2) % p
-        if nonce1 is not None:
-            assert pow(gg1, nonce1, p) == yy1
-
-        result = self._disjunctive_schnorr_identification_protocol(
-            prover_rank,
-            gg0,
-            yy0,
-            nonce0,
-            gg1,
-            yy1,
-            nonce1,
-        )
-
-        logging.debug(
-            "(%d): Executed disjunctive plaintext equivalence proof.",
-            self._communicator.rank,
-        )
-
-        return result
-
-    def oblivious_swap(
-        self,
-        rank: int,
-        ciphertext0: ElGamalCiphertext,
-        ciphertext1: ElGamalCiphertext,
-        flag: bool,
-    ) -> tuple[ElGamalCiphertext, ElGamalCiphertext]:
-        if rank < 0 or rank >= self._communicator.world_size:
-            msg = f"{rank}: An invalid rank."
-            raise ValueError(msg)
-        if rank != self._communicator.rank and flag:
-            msg = "An invalid argument."
-            raise ValueError(msg)
-
-        logging.debug(
-            "(%d): Executing Millimix primitive...", self._communicator.rank
-        )
-
-        _, _, p, q, _ = self._el_gamal.parameters
-        original_ciphertexts_product = (
-            (ciphertext0[0] * ciphertext1[0]) % p,
-            (ciphertext0[1] * ciphertext1[1]) % p,
-        )
-
-        if rank == self._communicator.rank:
-            if not flag:
-                (
-                    reencrypted_ciphertext0,
-                    nonce0,
-                ) = self._el_gamal.reencrypt(
-                    self._global_public_key, ciphertext0
-                )
-                (
-                    reencrypted_ciphertext1,
-                    nonce1,
-                ) = self._el_gamal.reencrypt(
-                    self._global_public_key, ciphertext1
-                )
-            else:
-                (
-                    reencrypted_ciphertext0,
-                    nonce0,
-                ) = self._el_gamal.reencrypt(
-                    self._global_public_key, ciphertext1
-                )
-                (
-                    reencrypted_ciphertext1,
-                    nonce1,
-                ) = self._el_gamal.reencrypt(
-                    self._global_public_key, ciphertext0
-                )
-
-            logging.debug(
-                "(%d): Broadcasting reencrypted ciphertexts...",
-                self._communicator.rank,
-            )
-            self._communicator.broadcast(
-                {
-                    "type": "millimix_primitive_reencryption",
-                    "rank": self._communicator.rank,
-                    "reencrypted_ciphertexts": [
-                        [
-                            reencrypted_ciphertext0[0],
-                            reencrypted_ciphertext0[1],
-                        ],
-                        [
-                            reencrypted_ciphertext1[0],
-                            reencrypted_ciphertext1[1],
-                        ],
-                    ],
-                }
-            )
-            logging.debug(
-                "(%d): Broadcasted reencrypted ciphertexts.",
-                self._communicator.rank,
-            )
-
-            if not flag:
-                result = self._disjunctive_plaintext_equivalence_proof(
-                    rank,
-                    reencrypted_ciphertext0,
-                    ciphertext0,
-                    nonce0,
-                    ciphertext1,
-                    None,
-                )
-            else:
-                result = self._disjunctive_plaintext_equivalence_proof(
-                    rank,
-                    reencrypted_ciphertext0,
-                    ciphertext0,
-                    None,
-                    ciphertext1,
-                    nonce0,
-                )
-            if not result:
-                raise RuntimeError("An invalid proof.")
-
-            reencrypted_ciphertexts_product = (
-                (reencrypted_ciphertext0[0] * reencrypted_ciphertext1[0]) % p,
-                (reencrypted_ciphertext0[1] * reencrypted_ciphertext1[1]) % p,
-            )
-            result = self._plaintext_equivalence_proof(
-                rank,
-                original_ciphertexts_product,
-                reencrypted_ciphertexts_product,
-                (nonce0 + nonce1) % q,
-            )
-            if not result:
-                raise RuntimeError("An invalid proof.")
-
-            logging.debug(
-                "(%d): Executed Millimix primitive.", self._communicator.rank
-            )
-
-            return (reencrypted_ciphertext0, reencrypted_ciphertext1)
-
-        logging.debug(
-            "(%d): Receiving reencrypted ciphertexts...",
-            self._communicator.rank,
-        )
-        data = self._communicator.recv(rank)
-        logging.debug(
-            "(%d): Received reencrypted ciphertexts.", self._communicator.rank
-        )
-        if not isinstance(data, dict):
-            raise RuntimeError("An invalid message.")
-        if "type" not in data:
-            raise RuntimeError("An invalid message.")
-        _type = data["type"]
-        if not isinstance(_type, str):
-            raise RuntimeError("An invalid message.")
-        if _type != "millimix_primitive_reencryption":
-            raise RuntimeError("An invalid message type.")
-        if "rank" not in data:
-            raise RuntimeError("An invalid message.")
-        opponent_rank = data["rank"]
-        if not isinstance(opponent_rank, int):
-            raise RuntimeError("An invalid message.")
-        if opponent_rank != rank:
-            raise RuntimeError("An invalid message.")
-        if "reencrypted_ciphertexts" not in data:
-            raise RuntimeError("An invalid message.")
-        reencrypted_ciphertexts = data["reencrypted_ciphertexts"]
-        if not isinstance(reencrypted_ciphertexts, list):
-            raise RuntimeError("An invalid message.")
-        if len(reencrypted_ciphertexts) != 2:
-            raise RuntimeError("An invalid message.")
-        for reencrypted_ciphertext in reencrypted_ciphertexts:
-            if not isinstance(reencrypted_ciphertext, list):
-                raise RuntimeError("An invalid message.")
-            if len(reencrypted_ciphertext) != 2:
-                raise RuntimeError("An invalid message.")
-            for c in reencrypted_ciphertext:
-                if not isinstance(c, int):
-                    raise RuntimeError("An invalid message.")
-
-        reencrypted_ciphertext0 = ElGamalCiphertext(
-            (
-                reencrypted_ciphertexts[0][0],
-                reencrypted_ciphertexts[0][1],
-            )
-        )
-        reencrypted_ciphertext1 = ElGamalCiphertext(
-            (
-                reencrypted_ciphertexts[1][0],
-                reencrypted_ciphertexts[1][1],
-            )
-        )
-
-        result = self._disjunctive_plaintext_equivalence_proof(
-            rank,
-            reencrypted_ciphertext0,
-            ciphertext0,
-            None,
-            ciphertext1,
-            None,
-        )
-        if not result:
-            raise RuntimeError("An invalid proof.")
-
-        reencrypted_ciphertexts_product = (
-            (reencrypted_ciphertext0[0] * reencrypted_ciphertext1[0]) % p,
-            (reencrypted_ciphertext0[1] * reencrypted_ciphertext1[1]) % p,
-        )
-        result = self._plaintext_equivalence_proof(
-            rank,
-            original_ciphertexts_product,
-            reencrypted_ciphertexts_product,
-            None,
-        )
-        if not result:
-            raise RuntimeError("An invalid proof.")
-
-        logging.debug(
-            "(%d): Executed Millimix primitive.", self._communicator.rank
-        )
-
-        return (reencrypted_ciphertext0, reencrypted_ciphertext1)
-
-    def _millimix(self, permutation: list[int], ciphertexts: list[ElGamalCiphertext]) -> None:
-        if len(ciphertexts) != len(permutation):
-            errmsg = "The length of ciphertexts and permutation must be the same."
+    def reencrypt(
+        self, ciphertext: ElGamalCiphertext, nonce: int | None = None
+    ) -> tuple[ElGamalCiphertext, int]:
+        _, _, _, q, _ = self._el_gamal.parameters
+        if nonce is not None and (nonce < 0 or nonce >= q):
+            errmsg = "The nonce must be in the range [0, q)."
             raise ValueError(errmsg)
 
-        permutation = permutation.copy()
+        if nonce is None:
+            nonce = agree_on_random_integer(self._communicator, q)
 
-        if len(ciphertexts) <= 1:
-            return
-
-        es: list[list[int]] = [[] for _ in range(len(ciphertexts) // 2)]
-        for i in range(len(ciphertexts) // 2):
-            index0 = i * 2
-            u = permutation[index0] // 2
-            index1 = i * 2 + 1
-            v = permutation[index1] // 2
-            es[u].append(i)
-            es[v].append(i)
-        s: set[int] = set()
-        flags = [False for _ in range(len(ciphertexts) // 2)]
-        for i in range(len(ciphertexts) // 2):
-            index0 = i * 2
-            index1 = i * 2 + 1
-            if permutation[index0] not in (0, 1) and permutation[index1] not in (0, 1):
-                continue
-            if permutation[index0] == 1 or permutation[index1] == 0:
-                u = permutation[index1] // 2
-                v = permutation[index0] // 2
-                flags[i] = True
-            else:
-                u = permutation[index0] // 2
-                v = permutation[index1] // 2
-            s.add(i)
-            while v != u:
-                if es[v][0] == i:
-                    j = es[v][1]
-                else:
-                    assert es[v][1] == i
-                    j = es[v][0]
-                if permutation[j * 2] // 2 == v:
-                    w = permutation[j * 2 + 1] // 2
-                else:
-                    assert permutation[j * 2 + 1] // 2 == v
-                    w = permutation[j * 2] // 2
-                    flags[j] = True
-                s.add(j)
-                v = w
-                i = j
-        for i in range(len(ciphertexts) // 2):
-            if i in s:
-                continue
-            index0 = i * 2
-            index1 = i * 2 + 1
-            if permutation[index0] in (0, 1) or permutation[index1] in (0, 1):
-                continue
-            u = permutation[index0] // 2
-            v = permutation[index1] // 2
-            s.add(i)
-            while v != u:
-                if es[v][0] == i:
-                    j = es[v][1]
-                else:
-                    assert es[v][1] == i
-                    j = es[v][0]
-                if permutation[j * 2] // 2 == v:
-                    w = permutation[j * 2 + 1] // 2
-                else:
-                    assert permutation[j * 2 + 1] // 2 == v
-                    w = permutation[j * 2] // 2
-                    flags[j] = True
-                s.add(j)
-                v = w
-                i = j
-        for i in range(len(ciphertexts) // 2):
-            index0 = i * 2
-            index1 = i * 2 + 1
-            if flags[i]:
-                permutation[index0], permutation[index1] = permutation[index1], permutation[index0]
-            ciphertexts[index0], ciphertexts[index1] = self.oblivious_swap(
-                self._communicator.rank,
-                ciphertexts[index0],
-                ciphertexts[index1],
-                flags[i],
-            )
-
-        ciphertexts0: list[ElGamalCiphertext] = []
-        permutation0: list[int] = []
-        for i in range(len(ciphertexts) // 2):
-            ciphertexts0.append(ciphertexts[i * 2])
-            permutation0.append(permutation[i * 2] // 2)
-        self._millimix(permutation0, ciphertexts0)
-        new_permutation0 = [-1 for _ in range(len(ciphertexts) // 2)]
-        for i in range(len(ciphertexts) // 2):
-            ciphertexts[i * 2] = ciphertexts0[i]
-            new_permutation0[permutation0[i]] = permutation[i * 2]
-
-        ciphertexts1: list[ElGamalCiphertext] = []
-        permutation1: list[int] = []
-        for i in range(len(ciphertexts) // 2):
-            ciphertexts1.append(ciphertexts[i * 2 + 1])
-            permutation1.append(permutation[i * 2 + 1] // 2)
-        self._millimix(permutation1, ciphertexts1)
-        new_permutation1 = [-1 for _ in range(len(ciphertexts) // 2)]
-        for i in range(len(ciphertexts) // 2):
-            ciphertexts[i * 2 + 1] = ciphertexts1[i]
-            new_permutation1[permutation1[i]] = permutation[i * 2 + 1]
-
-        for i in range(1, len(ciphertexts) // 2):
-            if new_permutation0[i] == i * 2:
-                assert new_permutation1[i] == i * 2 + 1
-                flag = False
-            else:
-                assert new_permutation0[i] == i * 2 + 1
-                assert new_permutation1[i] == i * 2
-                flag = True
-            index0 = i * 2
-            index1 = i * 2 + 1
-            ciphertexts[index0], ciphertexts[index1] = self.oblivious_swap(
-                self._communicator.rank,
-                ciphertexts[index0],
-                ciphertexts[index1],
-                flag,
-            )
-
-    def millimix(self, rank: int, ciphertexts: list[ElGamalCiphertext]) -> None:
-        if rank < 0 or rank >= self._communicator.world_size:
-            errmsg = f"{rank}: An invalid rank."
-            raise ValueError(errmsg)
-
-        logging.debug(
-            "(%d): Executing millimix...", self._communicator.rank
+        return self._el_gamal.reencrypt(
+            self._global_public_key, ciphertext, nonce
         )
-
-        if len(ciphertexts) <= 1:
-            logging.debug(
-                "(%d): Executed millimix.", self._communicator.rank
-            )
-
-            return
-
-        original_size = len(ciphertexts)
-        power_of_two = 1
-        while power_of_two < original_size:
-            power_of_two *= 2
-        for _ in range(power_of_two - original_size):
-            padding, _ = self.encrypt(1)
-            ciphertexts.append(padding)
-
-        if rank == self._communicator.rank:
-            permutation = [i for i in range(original_size)]
-            random.shuffle(permutation)
-            for i in range(original_size, len(ciphertexts)):
-                permutation.append(i)
-
-            self._millimix(permutation, ciphertexts)
-
-            while len(ciphertexts) > original_size:
-                ciphertexts.pop()
-
-            logging.debug(
-                "(%d): Executed millimix.", self._communicator.rank
-            )
-
-            return
-
-        for i in range(len(ciphertexts) // 2):
-            index0 = i * 2
-            index1 = i * 2 + 1
-            ciphertexts[index0], ciphertexts[index1] = self.oblivious_swap(
-                rank,
-                ciphertexts[index0],
-                ciphertexts[index1],
-                False,
-            )
-
-        ciphertexts0: list[ElGamalCiphertext] = []
-        for i in range(len(ciphertexts) // 2):
-            ciphertexts0.append(ciphertexts[i * 2])
-        self.millimix(rank, ciphertexts0)
-        for i in range(len(ciphertexts) // 2):
-            ciphertexts[i * 2] = ciphertexts0[i]
-
-        ciphertexts1: list[ElGamalCiphertext] = []
-        for i in range(len(ciphertexts) // 2):
-            ciphertexts1.append(ciphertexts[i * 2 + 1])
-        self.millimix(rank, ciphertexts1)
-        for i in range(len(ciphertexts) // 2):
-            ciphertexts[i * 2 + 1] = ciphertexts1[i]
-
-        for i in range(1, len(ciphertexts) // 2):
-            index0 = i * 2
-            index1 = i * 2 + 1
-            ciphertexts[index0], ciphertexts[index1] = self.oblivious_swap(
-                rank,
-                ciphertexts[index0],
-                ciphertexts[index1],
-                False,
-            )
-
-        while len(ciphertexts) > original_size:
-            ciphertexts.pop()
-
-        logging.debug("(%d): Executed millimix.", self._communicator.rank)
 
     def decrypt_privately(
         self, rank: int, ciphertext: ElGamalCiphertext
@@ -1651,12 +649,433 @@ class Cryptosystem:
 
         return None
 
+    def decrypt_publicly(self, ciphertext: ElGamalCiphertext) -> int:
+        logging.debug(
+            "(%d): Decrypting the ciphertext publicly...",
+            self._communicator.rank,
+        )
+
+        # TODO: Implement a more efficient decryption algorithm.
+        plaintext = -1
+        for rank in range(self._communicator.world_size):
+            m = self.decrypt_privately(rank, ciphertext)
+            if m is not None:
+                plaintext = m
+
+        logging.debug(
+            "(%d): Decrypted the ciphertext publicly.",
+            self._communicator.rank,
+        )
+
+        return plaintext
+
+    def furukawa_2005(
+        self, rank: int, ciphertexts: list[ElGamalCiphertext]
+    ) -> None:
+        if rank < 0 or rank >= self._communicator.world_size:
+            errmsg = f"{rank}: An invalid rank."
+            raise ValueError(errmsg)
+
+        logging.debug(
+            "(%d): Executing Furukawa 2005 protocol...",
+            self._communicator.rank,
+        )
+
+        g = [-1]
+        g.extend([x for x, _ in ciphertexts])
+        m = [-1]
+        m.extend([y for _, y in ciphertexts])
+
+        _, _, p, q, g[0] = self._el_gamal.parameters
+        m[0] = self._global_public_key
+
+        f: list[int] = []
+        for _ in range(5 + len(ciphertexts)):
+            f.append(agree_on_random_integer(self._communicator, q))
+            f[-1] = pow(g[0], f[-1], p)
+
+        if self._communicator.rank == rank:
+            permutation = list(range(len(ciphertexts)))
+            random.shuffle(permutation)
+            inverse_permutation = [-1 for _ in enumerate(ciphertexts)]
+            for i, j in enumerate(permutation):
+                inverse_permutation[j] = i
+
+            a: list[list[int]] = []
+            aa: list[int] = []
+            for i in range(5 + len(ciphertexts)):
+                a.append([])
+                aa.append(-1)
+                for j in range(5 + len(ciphertexts)):
+                    a[-1].append(-1)
+
+            # A_{0, i} (i = 1, 2, ..., k)
+            for i in range(len(ciphertexts)):
+                a[4][5 + i] = number.getRandomRange(0, q)
+
+            # A_{j, i} (i = 1, 2, ..., k, j = 1, 2, ..., k)
+            for i, _ in enumerate(ciphertexts):
+                for j, _ in enumerate(ciphertexts):
+                    if permutation[i] == j:
+                        a[5 + i][5 + j] = 1
+                    else:
+                        a[5 + i][5 + j] = 0
+
+            # g'_{i} (i = (0), 1, 2, ..., k)
+            # m'_{i} (i = (0), 1, 2, ..., k)
+            gg: list[int] = [-1]
+            mm: list[int] = [-1]
+            for i, _ in enumerate(ciphertexts):
+                ciphertext = ciphertexts[inverse_permutation[i]]
+                gg.append((pow(g[0], a[4][5 + i], p) * ciphertext[0]) % p)
+                mm.append((pow(m[0], a[4][5 + i], p) * ciphertext[1]) % p)
+
+            # {A_{\nu, 0}, A'_{\nu}} (\nu = -4, -3, ..., k)
+            for i in range(5 + len(ciphertexts)):
+                a[i][4] = number.getRandomRange(0, q)
+                aa[i] = number.getRandomRange(0, q)
+
+            # A_{-1, i} (i = 1, 2, ..., k)
+            for i in range(len(ciphertexts)):
+                a[3][5 + i] = number.getRandomRange(0, q)
+
+            # A_{-2, i} (i = 1, 2, ..., k)
+            for i, _ in enumerate(ciphertexts):
+                a[2][5 + i] = 0
+                for j, _ in enumerate(ciphertexts):
+                    a[2][5 + i] = (
+                        a[2][5 + i]
+                        + 3 * pow(a[5 + j][4], 2, q) * a[5 + j][5 + i]
+                    ) % q
+
+            # A_{-3, i} (i = 1, 2, ..., k)
+            for i, _ in enumerate(ciphertexts):
+                a[1][5 + i] = 0
+                for j, _ in enumerate(ciphertexts):
+                    a[1][5 + i] = (
+                        a[1][5 + i] + 3 * a[5 + j][4] * a[5 + j][5 + i]
+                    ) % q
+
+            # A_{-4, i} (i = 1, 2, ..., k)
+            for i, _ in enumerate(ciphertexts):
+                a[0][5 + i] = 0
+                for j, _ in enumerate(ciphertexts):
+                    a[0][5 + i] = (
+                        a[0][5 + i] + 2 * a[5 + j][4] * a[5 + j][5 + i]
+                    ) % q
+
+            # f'_{\mu} (\mu = 0, 1, ..., k)
+            ff = []
+            for i in range(1 + len(ciphertexts)):
+                ff.append(1)
+                for j in range(5 + len(ciphertexts)):
+                    ff[-1] = (ff[-1] * pow(f[j], a[j][4 + i], p)) % p
+
+            # f'_0
+            ff0 = 1
+            for i in range(5 + len(ciphertexts)):
+                ff0 = (ff0 * pow(f[i], aa[i], p)) % p
+
+            # g'_0
+            gg[0] = 1
+            for i in range(1 + len(ciphertexts)):
+                gg[0] = (gg[0] * pow(g[i], a[4 + i][4], p)) % p
+
+            # m'_0
+            mm[0] = 1
+            for i in range(1 + len(ciphertexts)):
+                mm[0] = (mm[0] * pow(m[i], a[4 + i][4], p)) % p
+
+            # w
+            w = (-a[2][4] - aa[1]) % q
+            assert w >= 0
+            for i, _ in enumerate(ciphertexts):
+                w = (w + pow(a[5 + i][4], 3, q)) % q
+
+            # w'
+            ww = (-a[0][4]) % q
+            for i, _ in enumerate(ciphertexts):
+                ww = (ww + pow(a[5 + i][4], 2, q)) % q
+                assert ww >= 0
+
+            commitment: list[int] = [ff0, w, ww]
+            commitment.extend(ff)
+
+            logging.debug(
+                "(%d): Broadcasting a commitment...", self._communicator.rank
+            )
+            self._communicator.broadcast(
+                {
+                    "type": "Cryptosystem.furukawa_2005.commitment",
+                    "rank": self._communicator.rank,
+                    "shuffled_ciphertexts": [[x, y] for x, y in zip(gg, mm)],
+                    "commitment": commitment,
+                },
+            )
+            logging.debug(
+                "(%d): Broadcasted a commitment.", self._communicator.rank
+            )
+
+            logging.debug(
+                "(%d): Receiving challenges...", self._communicator.rank
+            )
+            data_list = self._communicator.gather()
+            logging.debug(
+                "(%d): Received challenges.", self._communicator.rank
+            )
+            for data in data_list:
+                if not isinstance(data, dict):
+                    errmsg = "An invalid message."
+                    raise RuntimeError(errmsg)
+                if "type" not in data:
+                    errmsg = "An invalid message."
+                    raise RuntimeError(errmsg)
+                _type = data["type"]
+                if not isinstance(_type, str):
+                    errmsg = "An invalid message."
+                    raise RuntimeError(errmsg)
+                if _type != "Cryptosystem.furukawa_2005.challenge":
+                    errmsg = "An invalid message."
+                    raise RuntimeError(errmsg)
+                if "rank" not in data:
+                    errmsg = "An invalid message."
+                    raise RuntimeError(errmsg)
+                opponent_rank = data["rank"]
+                if not isinstance(opponent_rank, int):
+                    errmsg = "An invalid message."
+                    raise RuntimeError(errmsg)
+                if "challenge" not in data:
+                    errmsg = "An invalid message."
+                    raise RuntimeError(errmsg)
+                challenge = data["challenge"]
+                if not isinstance(challenge, list):
+                    errmsg = "An invalid message."
+                    raise RuntimeError(errmsg)
+                if len(challenge) != 1 + len(ciphertexts):
+                    errmsg = "An invalid message."
+                    raise RuntimeError(errmsg)
+
+                r: list[int] = []
+                for i in range(5 + len(ciphertexts)):
+                    r.append(0)
+                    for j in range(1 + len(ciphertexts)):
+                        r[-1] = (r[-1] + a[i][4 + j] * challenge[j]) % q
+
+                rr: list[int] = []
+                for i in range(5 + len(ciphertexts)):
+                    rr.append(aa[i])
+                    for j, _ in enumerate(ciphertexts):
+                        rr[-1] = (
+                            rr[-1] + a[i][5 + j] * pow(challenge[1 + j], 2, q)
+                        ) % q
+
+                logging.debug(
+                    "(%d): Sending response...", self._communicator.rank
+                )
+                self._communicator.send(
+                    opponent_rank,
+                    {
+                        "type": "Cryptosystem.furukawa_2005.response",
+                        "rank": self._communicator.rank,
+                        "response": [r, rr],
+                    },
+                )
+                logging.debug("(%d): Sent response.", self._communicator.rank)
+
+            logging.debug(
+                "(%d): Executed Furukawa 2005 protocol.",
+                self._communicator.rank,
+            )
+
+            return
+
+        logging.debug(
+            "(%d): Receiving a commitment...", self._communicator.rank
+        )
+        data = self._communicator.recv(rank)
+        logging.debug("(%d): Received a commitment.", self._communicator.rank)
+        if not isinstance(data, dict):
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        if "type" not in data:
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        _type = data["type"]
+        if not isinstance(_type, str):
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        if _type != "Cryptosystem.furukawa_2005.commitment":
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        if "rank" not in data:
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        opponent_rank = data["rank"]
+        if not isinstance(opponent_rank, int):
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        if opponent_rank != rank:
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        if "shuffled_ciphertexts" not in data:
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        shuffled_ciphertexts = data["shuffled_ciphertexts"]
+        if not isinstance(shuffled_ciphertexts, list):
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        if len(shuffled_ciphertexts) != 1 + len(ciphertexts):
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        gg = [x for x, _ in shuffled_ciphertexts]
+        mm = [y for _, y in shuffled_ciphertexts]
+        if "commitment" not in data:
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        values = data["commitment"]
+        if not isinstance(values, list):
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        if len(values) != 3 + (1 + len(ciphertexts)):
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        ff0, w, ww = values[0:3]
+        ff = values[3:]
+
+        challenge = [1]
+        challenge.extend(
+            [number.getRandomRange(0, q) for _ in enumerate(ciphertexts)]
+        )
+
+        logging.debug("(%d): Sending a challenge...", self._communicator.rank)
+        self._communicator.send(
+            rank,
+            {
+                "type": "Cryptosystem.furukawa_2005.challenge",
+                "rank": self._communicator.rank,
+                "challenge": challenge,
+            },
+        )
+        logging.debug("(%d): Sent a challenge.", self._communicator.rank)
+
+        logging.debug(
+            "(%d): Receiving the response...", self._communicator.rank
+        )
+        data = self._communicator.recv(rank)
+        logging.debug("(%d): Received the response.", self._communicator.rank)
+        if not isinstance(data, dict):
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        if "type" not in data:
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        _type = data["type"]
+        if not isinstance(_type, str):
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        if _type != "Cryptosystem.furukawa_2005.response":
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        if "rank" not in data:
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        opponent_rank = data["rank"]
+        if not isinstance(opponent_rank, int):
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        if opponent_rank != rank:
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        if "response" not in data:
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        response = data["response"]
+        if not isinstance(response, list):
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        if len(response) != 2:
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        r = response[0]
+        if not isinstance(r, list):
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        if len(r) != 5 + len(ciphertexts):
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        rr = response[1]
+        if not isinstance(rr, list):
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+        if len(rr) != 5 + len(ciphertexts):
+            errmsg = "An invalid message."
+            raise RuntimeError(errmsg)
+
+        alpha = number.getRandomRange(0, q)
+
+        lhs = 1
+        for i in range(5 + len(ciphertexts)):
+            lhs = (lhs * pow(f[i], (r[i] + alpha * rr[i]) % q, p)) % p
+        rhs = (ff[0] * pow(ff0, alpha, p)) % p
+        for i, _ in enumerate(ciphertexts):
+            rhs = (
+                rhs
+                * pow(
+                    ff[1 + i],
+                    challenge[1 + i] + alpha * pow(challenge[1 + i], 2, q),
+                    p,
+                )
+            ) % p
+        if lhs != rhs:
+            errmsg = "An invalid proof."
+            raise RuntimeError(errmsg)
+
+        lhs = 1
+        for i in range(1 + len(ciphertexts)):
+            lhs = (lhs * pow(g[i], r[4 + i], p)) % p
+        rhs = 1
+        for i in range(1 + len(ciphertexts)):
+            rhs = (rhs * pow(gg[i], challenge[i], p)) % p
+        if lhs != rhs:
+            errmsg = "An invalid proof."
+            raise RuntimeError(errmsg)
+
+        lhs = 1
+        for i in range(1 + len(ciphertexts)):
+            lhs = (lhs * pow(m[i], r[4 + i], p)) % p
+        rhs = 1
+        for i in range(1 + len(ciphertexts)):
+            rhs = (rhs * pow(mm[i], challenge[i], p)) % p
+        if lhs != rhs:
+            errmsg = f"({self._communicator.rank}): An invalid proof."
+            raise RuntimeError(errmsg)
+
+        lhs = 0
+        for i, _ in enumerate(ciphertexts):
+            lhs = (lhs + pow(r[5 + i], 3, q) - pow(challenge[1 + i], 3, q)) % q
+            assert lhs >= 0
+        if lhs != (r[2] + rr[1] + w) % q:
+            errmsg = "An invalid proof."
+            raise RuntimeError(errmsg)
+
+        lhs = 0
+        for i, _ in enumerate(ciphertexts):
+            lhs = (lhs + pow(r[5 + i], 2, q) - pow(challenge[1 + i], 2, q)) % q
+            assert lhs >= 0
+        if lhs != (r[0] + ww) % q:
+            errmsg = "An invalid proof."
+            raise RuntimeError(errmsg)
+
+        logging.debug(
+            "(%d): Executed Furukawa 2005 protocol.", self._communicator.rank
+        )
+
 
 def _process_main(local_urls: list[str], opponent_urls: list[str]) -> None:
     logging.basicConfig(level=logging.DEBUG)
 
     communicator = Communicator(local_urls, opponent_urls)
-    cryptosystem = Cryptosystem(communicator)
+    cryptosystem = Cryptosystem(communicator, 512)
 
     plaintext = 0xDEADBEEF
     ciphertext, _ = cryptosystem.encrypt(plaintext)
@@ -1668,26 +1087,27 @@ def _process_main(local_urls: list[str], opponent_urls: list[str]) -> None:
         else:
             assert decrypted_plaintext is None
 
-    plaintexts = [i for i in range(1, 136 + 1)]
-    ciphertexts: list[ElGamalCiphertext] = []
+    _, _, p, _, g = cryptosystem.parameters
+
+    plaintexts = [pow(g, i, p) for i in range(0, 136)]
+    ciphertexts = []
     for plaintext in plaintexts:
         ciphertext, _ = cryptosystem.encrypt(plaintext)
         ciphertexts.append(ciphertext)
 
+    start_time = time.time()
     for rank in range(communicator.world_size):
-        cryptosystem.millimix(rank, ciphertexts)
+        cryptosystem.furukawa_2005(rank, ciphertexts)
+    end_time = time.time()
+    print(f"Elapsed time: {end_time - start_time} [s]")
 
-    decrypted_plaintexts: list[int] = []
+    decrypted_plaintexts = []
     for ciphertext in ciphertexts:
-        decrypted_plaintext = cryptosystem.decrypt_privately(0, ciphertext)
-        if cryptosystem.communicator.rank != 0:
-            assert decrypted_plaintext is None
-            continue
-        assert decrypted_plaintext is not None
+        decrypted_plaintext = cryptosystem.decrypt_publicly(ciphertext)
         decrypted_plaintexts.append(decrypted_plaintext)
-    if cryptosystem.communicator.rank == 0:
-        decrypted_plaintexts.sort()
-        assert decrypted_plaintexts == plaintexts
+    plaintexts.sort()
+    decrypted_plaintexts.sort()
+    assert decrypted_plaintexts == plaintexts
 
 
 def _main() -> None:

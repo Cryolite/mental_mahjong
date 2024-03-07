@@ -8,14 +8,14 @@ class Communicator:
     def _agree_on_ranks(self) -> None:
         assert len(self._server_sockets) == len(self._client_sockets)
 
-        _BIT_LENGTH: Final = 1024
+        BIT_LENGTH: Final = 1024
         numbers: list[int] = []
         while True:
-            my_number = number.getRandomRange(0, 2 ** _BIT_LENGTH)
+            my_number = number.getRandomRange(0, 2**BIT_LENGTH)
             numbers.append(my_number)
 
             for client_socket in self._client_sockets:
-                client_socket.send(my_number.to_bytes(_BIT_LENGTH // 8, "big"))
+                client_socket.send(my_number.to_bytes(BIT_LENGTH // 8, "big"))
 
             for server_socket in self._server_sockets:
                 data = server_socket.recv()
@@ -57,7 +57,9 @@ class Communicator:
             opponent_urls: A list of URLs for the opponent processes.
         """
         if len(local_urls) != len(opponent_urls):
-            raise ValueError("The number of local URLs and opponent URLs must be the same.")
+            raise ValueError(
+                "The number of local URLs and opponent URLs must be the same."
+            )
 
         ctx = zmq.Context()
         self._server_sockets: list[zmq.Socket] = []
@@ -122,7 +124,9 @@ class Communicator:
             data_list: A list of messages to send.
         """
         if len(data_list) != self.world_size - 1:
-            raise ValueError("The length of `data_list` must be `world_size - 1`.")
+            raise ValueError(
+                "The length of `data_list` must be `world_size - 1`."
+            )
 
         for client_socket, data in zip(self._client_sockets, data_list):
             json_data = json.dumps(data)
